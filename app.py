@@ -190,6 +190,44 @@ def sentence_like_lines(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 
+
+def assess_evidence_quality(text: str) -> dict[str, str]:
+    """
+    Conservative, rule-based text-shape indicator—not a confidence score.
+    It cannot establish that a scientific claim is correct or reproducible.
+    """
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    words = re.findall(r"\b[\w'-]+\b", cleaned)
+    ends_sentence = bool(re.search(r'[.!?]["\'”’)]?$', cleaned))
+    starts_sentence_like = bool(re.match(r'^[A-Z0-9“"(]', cleaned))
+    starts_lowercase = bool(re.match(r"^[a-z]", cleaned))
+    # Text ending in these terms is often clipped at a line/page boundary.
+    dangling_end = bool(re.search(
+        r"\b(?:and|or|to|of|in|on|at|by|for|from|with|that|which|who|because|such|as|into|using|based|between|among|respectively)\s*[.!?,;:]?$",
+        cleaned,
+        flags=re.IGNORECASE,
+    ))
+    sentence_endings = len(re.findall(r"[.!?](?=\s|$)", cleaned))
+    reasonable_length = 8 <= len(words) <= 60
+
+    if len(words) < 7 or len(cleaned) < 40 or starts_lowercase or dangling_end:
+        return {
+            "quality_label": "Likely fragment",
+            "quality_reason": "Text is short, starts mid-sentence, or ends with a dangling term; inspect the source PDF.",
+        }
+
+    if ends_sentence and starts_sentence_like and reasonable_length and sentence_endings <= 2:
+        return {
+            "quality_label": "Looks complete",
+            "quality_reason": "Text has sentence-like boundaries and length. This is only a formatting heuristic; verify the claim in the PDF.",
+        }
+
+    return {
+        "quality_label": "Needs review",
+        "quality_reason": "Sentence boundaries or length are uncertain; manually inspect the passage and its surrounding context.",
+    }
+
+
 def extract_metric_evidence(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return candidate metric mentions with page number and exact text snippet."""
     found = []
@@ -207,10 +245,13 @@ def extract_metric_evidence(lines: list[dict[str, Any]]) -> list[dict[str, Any]]
         if key in seen:
             continue
         seen.add(key)
+        quality = assess_evidence_quality(line)
         found.append({
             "page": item["page"],
             "candidate_metrics": ", ".join(matches),
             "text_evidence": line[:500],
+            "evidence_quality": quality["quality_label"],
+            "quality_note": quality["quality_reason"],
             "verification_status": "Candidate mention — manually verify",
         })
         if len(found) >= 100:
@@ -234,7 +275,7 @@ def extract_field_evidence(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if normalized in seen_text:
                 continue
             seen_text.add(normalized)
-            unique.append(hit)
+            unique.append({**hit, **assess_evidence_quality(hit["text"])})
             if len(unique) == 5:
                 break
 
@@ -264,12 +305,23 @@ def build_blueprint(extracted: dict[str, Any]) -> dict[str, Any]:
     field_evidence = extract_field_evidence(lines)
     metric_evidence = extract_metric_evidence(lines)
     missing = [row["field"] for row in field_evidence if row["status"] == "Not detected"]
+    all_hits = [hit for row in field_evidence for hit in row["evidence"]]
+    quality_summary = {
+        "looks_complete": sum(hit["quality_label"] == "Looks complete" for hit in all_hits),
+        "needs_review": sum(hit["quality_label"] == "Needs review" for hit in all_hits),
+        "likely_fragment": sum(hit["quality_label"] == "Likely fragment" for hit in all_hits),
+        "note": (
+            "These labels assess text shape only. They are heuristic indicators, "
+            "not calibrated confidence scores and not verification of scientific claims."
+        ),
+    }
 
     return {
         "project": "Paper2Proof AI",
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "status": "Preliminary — requires human verification",
         "pages_processed": extracted["page_count"],
+        "evidence_quality_summary": quality_summary,
         "abstract_excerpt": abstract[:2000] if abstract else "",
         "methodology_excerpt": methodology[:3000] if methodology else "",
         "field_evidence": field_evidence,
@@ -297,13 +349,13 @@ st.markdown(
 )
 
 st.info(
-    "Day 2: rule-based extraction with page-level evidence. "
+    "Day 3: rule-based evidence quality indicators with page-level references. "
     "No external API, no invented results, and no automatic code execution."
 )
 
 with st.sidebar:
     st.header("Project")
-    st.write("Version: Day 2 — Evidence extraction")
+    st.write("Version: Day 3 — Evidence quality")
     st.write("Mode: Local processing")
     st.write("AI API: Not required")
     st.divider()
@@ -401,14 +453,23 @@ with tab_blueprint:
         or "Methodology section not detected reliably."
     )
 
+    st.markdown("#### Evidence quality overview")
+    quality = blueprint["evidence_quality_summary"]
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Looks complete", quality["looks_complete"])
+    q2.metric("Needs review", quality["needs_review"])
+    q3.metric("Likely fragment", quality["likely_fragment"])
+    st.caption(quality["note"])
+
     st.markdown("#### Field evidence (with page references)")
     for row in blueprint["field_evidence"]:
         with st.expander(f"{row['field']} — {row['status']}"):
             if not row["evidence"]:
                 st.write("No matching evidence line detected. This does not prove absence.")
             for hit in row["evidence"]:
-                st.markdown(f"**Page {hit['page']}**")
+                st.markdown(f"**Page {hit['page']}** · **{hit['quality_label']}**")
                 st.write(hit["text"])
+                st.caption(hit["quality_reason"])
 
     st.markdown("#### Missing or unconfirmed fields")
     if blueprint["missing_or_unconfirmed_fields"]:
@@ -430,7 +491,7 @@ with tab_metrics:
             hide_index=True,
         )
         st.caption(
-            "These are text matches, not verified reported scores. The value, "
+            "Evidence quality labels assess text shape only; these are text matches, not verified reported scores. The value, "
             "dataset, units, comparison baseline, and evaluation conditions "
             "must be checked in the original paper."
         )
@@ -463,6 +524,8 @@ with tab_export:
                     "status": field_row["status"],
                     "page": hit["page"],
                     "evidence_text": hit["text"],
+                    "evidence_quality": hit["quality_label"],
+                    "quality_note": hit["quality_reason"],
                 })
         else:
             flat_field_rows.append({
@@ -488,6 +551,6 @@ with tab_export:
 
 st.divider()
 st.caption(
-    "Paper2Proof AI · Day 2 · Evidence candidates, not a validated reproduction "
+    "Paper2Proof AI · Day 3 · Heuristic evidence labels, not validated reproduction "
     "of published results."
 )
